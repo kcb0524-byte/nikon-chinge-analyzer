@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+build/
+dist/
+*.egg-info/
+.DS_Store
+*.spec.bak
+installer_out/
+venv/
+.venv/

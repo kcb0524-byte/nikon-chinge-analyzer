@@ -1,0 +1,103 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install PyQt6 numpy soundfile pydub pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onedir --windowed --name "니콘 친게 음원 감별사" analyzer.py --noconfirm
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --quiet
+
+      - name: Create installer script
+        shell: python
+        run: |
+          iss = r"""
+[Setup]
+AppName=니콘 친게 음원 감별사
+AppVersion=1.0.0
+DefaultDirName={autopf}\NikonChingeAnalyzer
+DefaultGroupName=니콘 친게 음원 감별사
+OutputBaseFilename=NikonChingeAnalyzer_Setup
+OutputDir=installer_out
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+
+[Languages]
+Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "바탕화면 바로가기 만들기"
+
+[Files]
+Source: "dist\니콘 친게 음원 감별사\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{group}\니콘 친게 음원 감별사"; Filename: "{app}\니콘 친게 음원 감별사.exe"
+Name: "{autodesktop}\니콘 친게 음원 감별사"; Filename: "{app}\니콘 친게 음원 감별사.exe"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\니콘 친게 음원 감별사.exe"; Description: "지금 실행"; Flags: nowait postinstall skipifsilent
+"""
+          with open("setup.iss", "w", encoding="utf-8") as f:
+              f.write(iss)
+
+      - name: Build installer
+        run: |
+          mkdir installer_out
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: NikonChingeAnalyzer-Windows-Setup
+          path: installer_out/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: NikonChingeAnalyzer-Windows-Setup
+          path: release/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "니콘 친게 음원 감별사 ${{ github.ref_name }}"
+          body: |
+            ## 니콘 친게 음원 감별사 ${{ github.ref_name }}
+
+            **Windows**: `NikonChingeAnalyzer_Setup.exe` 다운로드 후 설치
+
+            ### 지원 형식
+            FLAC · WAV · MP3 · AIFF · OGG · M4A
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
