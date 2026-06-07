@@ -39,40 +39,38 @@ RED     = '#ff4444'
 AUDIO_EXTS = {'.flac','.wav','.aiff','.aif','.ogg','.mp3','.m4a','.aac','.opus','.wv'}
 
 # ─────────────────────────────────────────────
-# macOS 드래그앤드롭 — NSApp openFiles 방식
+# macOS 드래그앤드롭 — QApplication fileOpenRequest 방식
 # ─────────────────────────────────────────────
-_drop_callback = None   # MainWindow._add_files 로 연결
+class AudioApp(QApplication):
+    """QApplication.fileOpenRequest를 오버라이드해서 macOS Finder 드래그 처리"""
+    file_open = pyqtSignal(list)
 
-def setup_macos_drop():
-    """
-    macOS에서 Finder → 앱으로 드래그할 때 발생하는
-    application:openFiles: 이벤트를 pyobjc로 가로챕니다.
-    .app으로 패키징 시 Info.plist에 CFBundleDocumentTypes가 있어야
-    Finder가 드래그를 허용합니다.
-    """
-    try:
-        import objc
-        from AppKit import NSApplication, NSObject
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._block_file_open_until = 0  # drop 이후 FileOpen 중복 차단용
 
-        class _Delegate(NSObject):
-            @objc.python_method
-            def application_openFiles_(self, app, filenames):
-                if _drop_callback:
-                    paths = [str(f) for f in filenames]
-                    audio = [p for p in paths
-                             if os.path.splitext(p)[1].lower() in AUDIO_EXTS]
-                    if audio:
-                        _drop_callback(audio)
+    def block_file_open(self, ms=800):
+        """dropEvent 이후 ms 밀리초 동안 FileOpen 이벤트 무시"""
+        import time
+        self._block_file_open_until = time.time() + ms / 1000.0
 
-        ns_app = NSApplication.sharedApplication()
-        delegate = _Delegate.alloc().init()
-        ns_app.setDelegate_(delegate)
-        # Dock 아이콘 + 메뉴바 표시 (Regular app)
-        ns_app.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
-        return True
-    except Exception as e:
-        print(f'[macOS drop] 비활성: {e}')
-        return False
+    def event(self, e):
+        import time
+        from PyQt6.QtCore import QEvent
+        if e.type() == QEvent.Type.FileOpen:
+            path = e.file()
+            if path and os.path.splitext(path)[1].lower() in AUDIO_EXTS:
+                # drop 직후 차단 중이면 완전 무시
+                if time.time() < self._block_file_open_until:
+                    return True
+                # 이미 목록에 있는 파일이면 완전 무시 (setCurrentRow 포함 모든 동작 차단)
+                for w in self.topLevelWidgets():
+                    if hasattr(w, '_files_set') and path in w._files_set:
+                        return True
+                # 새 파일만 emit
+                self.file_open.emit([path])
+            return True
+        return super().event(e)
 
 
 # ─────────────────────────────────────────────
@@ -354,8 +352,11 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self.setAcceptDrops(True)
         self._workers = {}
-        self._files = []   # [(name, path)]
+        self._files = []         # [(name, path)]
+        self._files_set = set()  # 중복 방지용
         self._result = None
+        self._last_drop_paths = set()  # 직전 드롭 경로 (중복 호출 방지)
+        self._last_drop_time = 0
         self._apply_style()
         self._build_ui()
         self.open_files_signal.connect(self._add_files)
@@ -492,6 +493,8 @@ class MainWindow(QMainWindow):
         return f
 
     # ── 드래그앤드롭 (PyQt 레벨) ──────────────
+    # macOS .app 실행 시: NSApp openFiles가 처리하므로 PyQt drop은 개별 파일만 처리
+    # (폴더 드래그는 NSApp이 담당 → 중복 방지)
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.acceptProposedAction()
         else: e.ignore()
@@ -502,16 +505,27 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, e):
         paths = []
+        has_folder = False
         for url in e.mimeData().urls():
             p = url.toLocalFile()
-            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in AUDIO_EXTS:
-                paths.append(p)
+            if not p:
+                continue
+            if os.path.isfile(p):
+                if os.path.splitext(p)[1].lower() in AUDIO_EXTS:
+                    paths.append(p)
             elif os.path.isdir(p):
+                has_folder = True
                 for root, _, files in os.walk(p):
                     for f in sorted(files):
+                        if f.startswith('._'):
+                            continue
                         if os.path.splitext(f)[1].lower() in AUDIO_EXTS:
                             paths.append(os.path.join(root, f))
-        if paths: self._add_files(paths)
+        if paths:
+            # 폴더 드래그 시 macOS FileOpen 이벤트 중복 차단
+            if has_folder:
+                QApplication.instance().block_file_open(1500)
+            self._add_files(paths)
         e.acceptProposedAction()
 
     # ── 파일 관리 ─────────────────────────────
@@ -522,18 +536,59 @@ class MainWindow(QMainWindow):
         if paths: self._add_files(paths)
 
     def _add_files(self, paths):
-        existing = {p for _,p in self._files}
+        import time
+        now = time.time()
+        # 500ms 이내에 동일한 파일 목록이 또 들어오면 무시 (중복 호출 방지)
+        key = tuple(sorted(paths))
+        if key == self._last_drop_paths and (now - self._last_drop_time) < 0.5:
+            return
+        self._last_drop_paths = key
+        self._last_drop_time = now
+
+        # 추가 전에 먼저 유효하지 않은 항목 정리
+        self._purge_invalid()
+
+        prev_row = self.flist.currentRow()
+        added = 0
+
         for p in paths:
-            if p not in existing:
+            if not p or not p.strip():
+                continue
+            p = p.strip()
+            if not os.path.isfile(p):
+                continue
+            # macOS 숨김 메타데이터 파일(._filename) 제외
+            if os.path.basename(p).startswith('._'):
+                continue
+            if os.path.splitext(p)[1].lower() not in AUDIO_EXTS:
+                continue
+            if p not in self._files_set:
+                self._files_set.add(p)
                 name = os.path.basename(p)
                 self._files.append((name, p))
                 self.flist.addItem(f'  {name}')
-                existing.add(p)
-        if self.flist.currentRow() < 0 and self.flist.count() > 0:
+                added += 1
+
+        # 실제로 추가된 파일이 없으면 선택 변경 없음
+        if added == 0:
+            return
+
+        # 기존 선택 유지, 선택 없을 때만 0번으로
+        if prev_row >= 0:
+            self.flist.setCurrentRow(prev_row)
+        elif self.flist.count() > 0:
             self.flist.setCurrentRow(0)
 
+    def _purge_invalid(self):
+        """파일 목록에서 실제 존재하지 않거나 빈 항목 자동 삭제"""
+        to_remove = [i for i, (_, p) in enumerate(self._files)
+                     if not p or not os.path.isfile(p)]
+        for i in reversed(to_remove):
+            self._files.pop(i)
+            self.flist.takeItem(i)
+
     def _clear(self):
-        self._files.clear(); self.flist.clear()
+        self._files.clear(); self._files_set.clear(); self.flist.clear()
         self._result = None
         self.spec.set_data(None); self.eng.set_data(None)
         self.fname_lbl.setText('파일을 선택하거나 드래그해서 분석을 시작하세요')
@@ -567,26 +622,30 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg):
         self.prog.setVisible(False)
-        self.verdict_lbl.setText('오류'); self.verdict_lbl.setStyleSheet(f'color:{RED};font-size:22px;font-weight:800;')
-        self.detail_lbl.setText(msg)
+        # 분석 실패한 항목은 리스트에서 자동 제거
+        row = self.flist.currentRow()
+        if row >= 0 and row < len(self._files):
+            p = self._files[row][1]
+            self._files.pop(row)
+            self._files_set.discard(p)
+            self.flist.takeItem(row)
+            # 다음 항목 자동 선택
+            if self.flist.count() > 0:
+                self.flist.setCurrentRow(min(row, self.flist.count() - 1))
 
 
 # ─────────────────────────────────────────────
 # 진입점
 # ─────────────────────────────────────────────
 def main():
-    global _drop_callback
-    app = QApplication(sys.argv)
+    app = AudioApp(sys.argv)
     app.setApplicationName('니콘 친게 음원 감별사')
     app.setStyle('Fusion')
 
     win = MainWindow()
 
-    # macOS NSApp 드래그앤드롭 연결
-    def _ns_open(paths):
-        win.open_files_signal.emit(paths)
-    _drop_callback = _ns_open
-    setup_macos_drop()
+    # QApplication.FileOpen 이벤트 → 파일 추가 (macOS Finder 드래그앤드롭)
+    app.file_open.connect(win._add_files)
 
     win.show()
     sys.exit(app.exec())
